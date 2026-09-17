@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse
 from . import config
 from .db import _rollback_quietly, connect, init_db, seed_buckets
 from .quota import earliest_retry_at, merge_items, payload_hash
-from .schemas import BucketConfig, ConsumeRequest
+from .schemas import BucketConfig, ConsumeRequest, ReleaseRequest
 
 logger = logging.getLogger("quota")
 
@@ -192,6 +192,128 @@ def _decision_response(decision: dict, replayed: bool) -> JSONResponse:
     if decision.get("retry_after_seconds") is not None:
         headers["Retry-After"] = str(math.ceil(decision["retry_after_seconds"]))
     return JSONResponse(status_code=429, content=decision, headers=headers)
+
+
+# ---------------------------------------------------------------- 配额释放
+
+@app.post("/v1/quota/releases")
+def release(req: ReleaseRequest):
+    """撤销一次已放行消费对所有桶的用量贡献。
+
+    首次释放在单个 BEGIN IMMEDIATE 事务内完成"校验 → 删除该请求全部用量
+    事件 → 标记消费已释放 → 固化释放结果"，任一环节失败整体回滚，
+    不会出现部分桶已恢复。
+
+    - 200：释放成功（或同 release_id + 同 request_id 重放，原样返回并带
+      X-Idempotent-Replay: true）；
+    - 404：原消费 request_id 不存在；
+    - 409：原判定为拒绝 / 已被其他 release_id 释放 / release_id 已指向
+      其他 request_id / 并发竞争落败。
+    """
+    now = time.time()
+
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                "SELECT request_id, result FROM releases WHERE release_id = ?",
+                (req.release_id,),
+            ).fetchone()
+            if existing is not None:
+                # 幂等：同 release_id 必须指向同一目标，原样返回固化结果
+                if existing["request_id"] != req.request_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"release_id '{req.release_id}' 已用于释放 "
+                            f"request_id '{existing['request_id']}'，不可改指其他消费请求"
+                        ),
+                    )
+                conn.execute("COMMIT")
+                result = json.loads(existing["result"])
+                replayed = True
+            else:
+                result = _release_consumption(conn, req.release_id, req.request_id, now)
+                conn.execute(
+                    "INSERT INTO releases (release_id, request_id, result, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        req.release_id,
+                        req.request_id,
+                        json.dumps(result),
+                        now,
+                    ),
+                )
+                conn.execute("COMMIT")
+                replayed = False
+        except Exception:
+            _rollback_quietly(conn)
+            raise
+    finally:
+        conn.close()
+
+    return JSONResponse(
+        status_code=200,
+        content=result,
+        headers={"X-Idempotent-Replay": "true"} if replayed else {},
+    )
+
+
+def _release_consumption(
+    conn: sqlite3.Connection, release_id: str, request_id: str, now: float
+) -> dict:
+    """在事务内撤销一个消费请求对所有桶的用量贡献并记录占用关系。"""
+    row = conn.execute(
+        "SELECT allowed, payload, release_id FROM requests WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"消费请求 '{request_id}' 不存在，无法释放",
+        )
+    if not row["allowed"]:
+        # 原判定为拒绝：从未产生任何扣减，无可释放内容
+        raise HTTPException(
+            status_code=409,
+            detail=f"消费请求 '{request_id}' 原判定为拒绝（429），未发生扣减，不可释放",
+        )
+    if row["release_id"] is not None:
+        # 同一消费只能由一个 release_id 成功释放；并发竞争中的其余请求亦落到此
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"消费请求 '{request_id}' 已被 release_id '{row['release_id']}' 释放；"
+                "同一消费请求只能释放一次"
+            ),
+        )
+
+    payload = json.loads(row["payload"])
+    # 删除该请求对所有桶的用量贡献（与首次扣减写入的事件一一对应）
+    deleted = conn.execute(
+        "DELETE FROM usage_events WHERE request_id = ?",
+        (request_id,),
+    ).rowcount
+    # 条件 UPDATE 兜底并发竞争：仅当尚未被其他释放单占用时成功
+    cur = conn.execute(
+        "UPDATE requests SET release_id = ? WHERE request_id = ? AND release_id IS NULL",
+        (release_id, request_id),
+    )
+    if cur.rowcount != 1:  # pragma: no cover - 理论上前置检查已覆盖，防御性保留
+        raise HTTPException(
+            status_code=409,
+            detail=f"消费请求 '{request_id}' 已被其他释放单抢先释放",
+        )
+
+    return {
+        "release_id": release_id,
+        "request_id": request_id,
+        "released": True,
+        "released_buckets": payload["buckets"],
+        "events_reverted": deleted,
+        "released_at": now,
+    }
 
 
 # ---------------------------------------------------------------- 桶管理

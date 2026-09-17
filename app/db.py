@@ -32,15 +32,34 @@ CREATE INDEX IF NOT EXISTS idx_usage_events_bucket_ts
     ON usage_events (bucket_key, created_at);
 
 -- 幂等表：request_id 首次出现时固化载荷哈希与判定结果
+-- release_id 非空表示该消费已被对应释放单成功释放
 CREATE TABLE IF NOT EXISTS requests (
     request_id   TEXT PRIMARY KEY,
     payload_hash TEXT    NOT NULL,
     payload      TEXT    NOT NULL,
     decision     TEXT    NOT NULL,
     allowed      INTEGER NOT NULL,
+    release_id   TEXT,
     created_at   REAL    NOT NULL
 );
+
+-- 释放幂等表：release_id 首次成功释放时固化目标 request_id 与释放结果
+CREATE TABLE IF NOT EXISTS releases (
+    release_id  TEXT PRIMARY KEY,
+    request_id  TEXT    NOT NULL,
+    result      TEXT    NOT NULL,
+    created_at  REAL    NOT NULL
+);
 """
+
+# 旧库增量迁移：为已存在的 requests 表补充 release_id 列
+_MIGRATIONS = (
+    (
+        "requests",
+        "release_id",
+        "ALTER TABLE requests ADD COLUMN release_id TEXT",
+    ),
+)
 
 
 def connect(db_path: str | None = None) -> sqlite3.Connection:
@@ -59,8 +78,17 @@ def init_db(db_path: str | None = None) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        _apply_migrations(conn)
     finally:
         conn.close()
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """对旧版本数据库执行增量列迁移（SQLite 无 ADD COLUMN IF NOT EXISTS）。"""
+    for table, column, ddl in _MIGRATIONS:
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(ddl)
 
 
 def seed_buckets(config_path: str, db_path: str | None = None) -> list[str]:

@@ -14,6 +14,11 @@ class ConsumeRequest(BaseModel):
     buckets: list[BucketItem] = Field(min_length=1, max_length=100)
 
 
+class ReleaseRequest(BaseModel):
+    release_id: str = Field(min_length=1, max_length=128)
+    request_id: str = Field(min_length=1, max_length=128)
+
+
 class BucketConfig(BaseModel):
     limit: int = Field(gt=0, le=2**31 - 1)
     window_seconds: float = Field(gt=0, le=365 * 24 * 3600)

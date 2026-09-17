@@ -9,6 +9,8 @@
 - **原子扣减**：单事务内检查 + 扣减全部桶，任一超限则整体不扣减（all-or-nothing）
 - **幂等判定**：`request_id` 首次出现时固化载荷与判定；相同内容重放原样返回
   （响应头 `X-Idempotent-Replay: true`），内容变化返回 **409**
+- **原子释放**：`POST /v1/quota/releases` 在单事务内撤销一次已放行消费对**所有桶**
+  的用量贡献；同一消费只能由一个 `release_id` 释放，重放原样返回
 - **并发安全**：SQLite `BEGIN IMMEDIATE` 串行化写事务，并发请求不会突破限额
 - **用量查询**：随时查询桶当前窗口用量
 
@@ -95,7 +97,40 @@ curl -X POST http://localhost:8000/v1/quota/consume \
        "buckets": [{"key": "api-requests", "amount": 2}]}'
 ```
 
-### 3. 查询桶当前窗口用量
+### 3. 释放已放行的消费（恢复用量）
+
+```bash
+curl -X POST http://localhost:8000/v1/quota/releases \
+  -H 'Content-Type: application/json' \
+  -d '{"release_id": "release-001", "request_id": "req-001"}'
+```
+
+成功（`200`）：在**单个事务**内删除 `req-001` 对所有桶的扣减事件，用量即刻恢复；
+不会出现部分桶已恢复、部分未恢复：
+
+```json
+{"release_id": "release-001", "request_id": "req-001",
+ "released": true,
+ "released_buckets": [{"key": "api-requests", "amount": 1},
+                      {"key": "llm-tokens", "amount": 500}],
+ "events_reverted": 2,
+ "released_at": 1789657690.12}
+```
+
+释放语义：
+
+| 场景 | 结果 |
+| --- | --- |
+| 相同 `release_id` + 相同 `request_id` 重放 | `200`，原样返回首次释放结果，响应头 `X-Idempotent-Replay: true`，不重复恢复 |
+| 相同 `release_id` 改指其他 `request_id` | `409` |
+| 同一消费请求用另一个 `release_id` 再次释放（含并发竞争落败方） | `409` |
+| 原 `request_id` 不存在 | `404` |
+| 原消费判定为拒绝（`429`，从未扣减） | `409` |
+
+释放后重放原 `consume` 仍返回其已固化的判定（带 `X-Idempotent-Replay: true`），
+**不会再次扣减**；恢复出的额度可供新的 `request_id` 使用。
+
+### 4. 查询桶当前窗口用量
 
 ```bash
 curl http://localhost:8000/v1/buckets/llm-tokens/usage
@@ -113,6 +148,7 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/v1/quota/consume` | 多桶检查 + 扣减；`200` 放行 / `429` 超限 / `409` 幂等冲突 / `404` 桶未配置 |
+| `POST` | `/v1/quota/releases` | 释放一次已放行消费；`200` 成功或重放 / `409` 冲突 / `404` 原请求不存在 |
 | `GET` | `/v1/buckets/{key}/usage` | 查询桶当前滚动窗口用量 |
 | `PUT` | `/v1/buckets/{key}` | 创建或更新桶（`limit`、`window_seconds`） |
 | `GET` | `/v1/buckets` | 列出全部桶配置 |
@@ -131,10 +167,16 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 ## 实现说明
 
 - **原子性**：`consume` 在单个 `BEGIN IMMEDIATE` 事务内完成"读窗口用量 → 判定 →
-  写扣减事件 → 固化判定"，任一环节失败整体回滚。
+  写扣减事件 → 固化判定"，任一环节失败整体回滚。`release` 同理：在单个写事务内
+  完成"校验原请求 → 删除其全部 `usage_events` → 标记 `requests.release_id`
+  → 写入 `releases` 释放记录"，保证所有桶同时恢复。
 - **并发**：`BEGIN IMMEDIATE` 使写事务在数据库级串行化；WAL 模式保证读（用量查询）不阻塞。
+  多个不同 `release_id` 并发释放同一消费时，事务串行化 + 占用标记保证仅一个成功，
+  其余返回 `409`。
 - **幂等**：`requests` 表以 `request_id` 为主键，固化载荷 SHA-256 与判定 JSON；
-  重放命中时直接返回，哈希不一致返回 409。
+  重放命中时直接返回，哈希不一致返回 409。`releases` 表以 `release_id` 为主键固化
+  目标 `request_id` 与释放结果：同目标重放原样返回并带 `X-Idempotent-Replay: true`，
+  改指其他目标返回 409。
 - **最早重试时间**：按窗口内事件过期时刻累计释放量，找到最早可容纳本次请求的过期点；
   多桶受限时取各桶的最大值。
 
@@ -146,4 +188,6 @@ python -m pytest tests/ -q
 ```
 
 覆盖：原子扣减、幂等重放（含拒绝判定重放）、409 冲突、滚动窗口过期恢复、
-50 并发不超限额、同 `request_id` 并发只扣减一次等 14 个用例。
+50 并发不超限额、同 `request_id` 并发只扣减一次，以及释放接口的多桶原子恢复、
+幂等重放、改指冲突、重复释放冲突、404/409 分支、释放后 consume 重放不再次扣减、
+20 并发释放仅一个成功等共 27 个用例。
