@@ -40,6 +40,17 @@ CREATE TABLE IF NOT EXISTS requests (
     allowed      INTEGER NOT NULL,
     created_at   REAL    NOT NULL
 );
+
+-- 释放记录表：release_id 固化一次释放结果（同键重放原样返回）；
+-- request_id 上的唯一索引保证同一消费请求只能被一个 release_id 成功释放
+CREATE TABLE IF NOT EXISTS releases (
+    release_id  TEXT PRIMARY KEY,
+    request_id  TEXT    NOT NULL,
+    result      TEXT    NOT NULL,
+    created_at  REAL    NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_releases_request_id
+    ON releases (request_id);
 """
 
 

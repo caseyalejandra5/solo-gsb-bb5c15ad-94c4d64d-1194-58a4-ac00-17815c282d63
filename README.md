@@ -7,9 +7,13 @@
 
 - **滚动窗口**：每个桶独立配置限额与窗口（秒），窗口内用量随事件过期滚动释放
 - **原子扣减**：单事务内检查 + 扣减全部桶，任一超限则整体不扣减（all-or-nothing）
+- **配额释放**：`POST /v1/quota/releases` 在单事务内撤销原消费请求对**全部桶**的用量贡献，
+  不存在部分桶恢复；`release_id` 同键同目标重放原样返回，改指其他目标返回 **409**
 - **幂等判定**：`request_id` 首次出现时固化载荷与判定；相同内容重放原样返回
-  （响应头 `X-Idempotent-Replay: true`），内容变化返回 **409**
-- **并发安全**：SQLite `BEGIN IMMEDIATE` 串行化写事务，并发请求不会突破限额
+  （响应头 `X-Idempotent-Replay: true`），内容变化返回 **409**；
+  释放后重放仍返回固化结果且不会再次扣减
+- **并发安全**：SQLite `BEGIN IMMEDIATE` 串行化写事务，并发请求不会突破限额；
+  同一消费请求并发释放时仅一个 `release_id` 成功
 - **用量查询**：随时查询桶当前窗口用量
 
 ## 快速启动
@@ -95,7 +99,52 @@ curl -X POST http://localhost:8000/v1/quota/consume \
        "buckets": [{"key": "api-requests", "amount": 2}]}'
 ```
 
-### 3. 查询桶当前窗口用量
+### 3. 释放配额（撤销已放行的消费）
+
+对已放行的消费请求，可凭独立的 `release_id` 撤销它对所有桶的用量贡献：
+
+```bash
+curl -X POST http://localhost:8000/v1/quota/releases \
+  -H 'Content-Type: application/json' \
+  -d '{"release_id": "rel-001", "request_id": "req-001"}'
+```
+
+成功（`200`，单事务内撤销该请求的全部用量事件）：
+
+```json
+{"release_id": "rel-001", "request_id": "req-001",
+ "released": true,
+ "released_buckets": [{"key": "api-requests", "amount": 1},
+                      {"key": "llm-tokens", "amount": 500}],
+ "events_released": 2, "released_at": 1789657700.12}
+```
+
+释放语义：
+
+- **同 `release_id` + 同 `request_id` 重放**：原样返回首次结果，
+  响应头 `X-Idempotent-Replay: true`，不会重复撤销；
+- **同 `release_id` 改指其他 `request_id`**：`409 Conflict`；
+- **同一 `request_id` 被另一个 `release_id` 释放**（含并发竞争落败者）：`409 Conflict`，
+  即一个消费请求只能被成功释放一次；
+- **原 `request_id` 不存在**：`404 Not Found`；
+- **原判定为拒绝（429）**：未产生用量，释放返回 `409 Conflict`；
+- **释放后重放原 `consume`**：仍返回首次固化的判定（带 `X-Idempotent-Replay: true`），
+  但用量不会被再次扣减。
+
+```bash
+# 重复释放（幂等重放）
+curl -X POST http://localhost:8000/v1/quota/releases \
+  -H 'Content-Type: application/json' \
+  -d '{"release_id": "rel-001", "request_id": "req-001"}'
+# → 200，响应头 X-Idempotent-Replay: true
+
+# release_id 改指其他请求 → 409
+curl -X POST http://localhost:8000/v1/quota/releases \
+  -H 'Content-Type: application/json' \
+  -d '{"release_id": "rel-001", "request_id": "req-002"}'
+```
+
+### 4. 查询桶当前窗口用量
 
 ```bash
 curl http://localhost:8000/v1/buckets/llm-tokens/usage
@@ -113,6 +162,7 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/v1/quota/consume` | 多桶检查 + 扣减；`200` 放行 / `429` 超限 / `409` 幂等冲突 / `404` 桶未配置 |
+| `POST` | `/v1/quota/releases` | 释放原消费请求的全部桶用量；`200` 成功（重放带 `X-Idempotent-Replay`）/ `409` 改目标·重复释放·原请求被拒 / `404` 原请求不存在 |
 | `GET` | `/v1/buckets/{key}/usage` | 查询桶当前滚动窗口用量 |
 | `PUT` | `/v1/buckets/{key}` | 创建或更新桶（`limit`、`window_seconds`） |
 | `GET` | `/v1/buckets` | 列出全部桶配置 |
@@ -132,6 +182,14 @@ curl http://localhost:8000/v1/buckets/llm-tokens/usage
 
 - **原子性**：`consume` 在单个 `BEGIN IMMEDIATE` 事务内完成"读窗口用量 → 判定 →
   写扣减事件 → 固化判定"，任一环节失败整体回滚。
+- **释放原子性**：`release` 在同一个 `BEGIN IMMEDIATE` 事务内完成
+  "校验原请求 → `DELETE` 该 `request_id` 的全部用量事件 → 写释放记录"，
+  失败整体回滚，不会出现部分桶已恢复。
+- **唯一释放**：`releases` 表以 `release_id` 为主键（同键重放/改目标检测），
+  并在 `request_id` 上建唯一索引；并发竞争中落败的插入触发 `IntegrityError`，
+  映射为 409，保证一个消费请求只能被一个 `release_id` 成功释放。
+- **释放后重放**：释放只删除 `usage_events` 中的事件，`requests` 中固化的判定不变，
+  因此重放 `consume` 仍原样返回固化结果但不再写入用量；释放出的额度可被新请求使用。
 - **并发**：`BEGIN IMMEDIATE` 使写事务在数据库级串行化；WAL 模式保证读（用量查询）不阻塞。
 - **幂等**：`requests` 表以 `request_id` 为主键，固化载荷 SHA-256 与判定 JSON；
   重放命中时直接返回，哈希不一致返回 409。
@@ -146,4 +204,6 @@ python -m pytest tests/ -q
 ```
 
 覆盖：原子扣减、幂等重放（含拒绝判定重放）、409 冲突、滚动窗口过期恢复、
-50 并发不超限额、同 `request_id` 并发只扣减一次等 14 个用例。
+50 并发不超限额、同 `request_id` 并发只扣减一次，以及配额释放的全桶恢复、
+同键重放、改目标 409、重复释放 409、原请求 404/拒绝 409、释放后 consume 重放、
+10 并发释放仅一个成功、同 `release_id` 并发重放等 26 个用例。

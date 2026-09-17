@@ -44,6 +44,12 @@ def _consume(rid: str, key: str, amount: int):
     })
 
 
+def _release(rel_id: str, rid: str):
+    return client.post("/v1/quota/releases", json={
+        "release_id": rel_id, "request_id": rid,
+    })
+
+
 def test_seeded_bucket_and_consume():
     # 启动时从 QUOTA_BUCKETS_CONFIG 播种
     keys = [b["key"] for b in client.get("/v1/buckets").json()["buckets"]]
@@ -223,4 +229,186 @@ def test_validation_errors():
     # buckets 不能为空
     assert client.post("/v1/quota/consume", json={
         "request_id": _rid(), "buckets": [],
+    }).status_code == 422
+
+
+# ---------------------------------------------------------------- 释放
+
+def test_release_restores_all_buckets_atomically():
+    """释放后该请求涉及的所有桶用量全部恢复。"""
+    k1, k2 = _bucket(10, 60), _bucket(20, 60)
+    rid = _rid()
+    r = client.post("/v1/quota/consume", json={
+        "request_id": rid,
+        "buckets": [{"key": k1, "amount": 4}, {"key": k2, "amount": 7}],
+    })
+    assert r.status_code == 200
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 4
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 7
+
+    rel = _rid()
+    rr = _release(rel, rid)
+    assert rr.status_code == 200, rr.text
+    body = rr.json()
+    assert body["released"] is True
+    assert body["release_id"] == rel and body["request_id"] == rid
+    assert body["released_buckets"] == sorted(
+        [{"key": k1, "amount": 4}, {"key": k2, "amount": 7}],
+        key=lambda b: b["key"],
+    )
+    assert body["events_released"] == 2
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 0
+
+
+def test_release_frees_capacity_for_new_request():
+    key = _bucket(5, 60)
+    rid = _rid()
+    assert _consume(rid, key, 5).status_code == 200
+    assert _consume(_rid(), key, 1).status_code == 429
+
+    assert _release(_rid(), rid).status_code == 200
+    # 释放后新请求可使用恢复出的额度
+    assert _consume(_rid(), key, 5).status_code == 200
+
+
+def test_release_idempotent_replay():
+    key = _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, key, 3).status_code == 200
+    payload = {"release_id": "rel-1", "request_id": rid}
+
+    r1 = client.post("/v1/quota/releases", json=payload)
+    assert r1.status_code == 200
+    r2 = client.post("/v1/quota/releases", json=payload)
+    assert r2.status_code == 200
+    assert r2.json() == r1.json()
+    assert r2.headers.get("X-Idempotent-Replay") == "true"
+    # 重放不重复删除：桶用量仍为 0，新请求可拿满额度
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 0
+    assert _consume(_rid(), key, 10).status_code == 200
+
+
+def test_release_same_id_other_target_conflicts():
+    k1, k2 = _bucket(10, 60), _bucket(10, 60)
+    rid1, rid2 = _rid(), _rid()
+    assert _consume(rid1, k1, 1).status_code == 200
+    assert _consume(rid2, k2, 1).status_code == 200
+
+    rel = _rid()
+    assert _release(rel, rid1).status_code == 200
+    # 同一 release_id 改指其他 request_id → 409，原释放仍然有效
+    assert _release(rel, rid2).status_code == 409
+    assert client.get(f"/v1/buckets/{k1}/usage").json()["used"] == 0
+    assert client.get(f"/v1/buckets/{k2}/usage").json()["used"] == 1
+
+
+def test_request_can_only_be_released_once():
+    key = _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, key, 2).status_code == 200
+    assert _release(_rid(), rid).status_code == 200
+    # 另一 release_id 再释放同一 request_id → 409
+    r = _release(_rid(), rid)
+    assert r.status_code == 409
+
+
+def test_release_unknown_request_404():
+    r = _release(_rid(), _rid())
+    assert r.status_code == 404
+
+
+def test_release_denied_request_conflicts():
+    key = _bucket(2, 60)
+    assert _consume(_rid(), key, 2).status_code == 200
+    denied = _rid()
+    assert _consume(denied, key, 1).status_code == 429
+
+    r = _release(_rid(), denied)
+    assert r.status_code == 409
+    # 拒绝请求本就没有用量
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 2
+
+
+def test_consume_replay_after_release_unchanged():
+    """释放后重放原 consume：原样返回固化结果，且不得再次扣减。"""
+    key = _bucket(5, 60)
+    rid = _rid()
+    payload = {"request_id": rid, "buckets": [{"key": key, "amount": 5}]}
+    r1 = client.post("/v1/quota/consume", json=payload)
+    assert r1.status_code == 200
+    assert _release(_rid(), rid).status_code == 200
+
+    r2 = client.post("/v1/quota/consume", json=payload)
+    assert r2.status_code == 200
+    assert r2.json() == r1.json()
+    assert r2.headers.get("X-Idempotent-Replay") == "true"
+    # 固化判定被原样返回，但用量事件未被重新写入
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 0
+    # 释放出的额度仍可被新请求使用
+    assert _consume(_rid(), key, 5).status_code == 200
+
+
+def test_concurrent_releases_single_winner():
+    """同一 request_id 被 10 个不同 release_id 并发释放：仅一个 200，其余 409。"""
+    key = _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, key, 3).status_code == 200
+
+    codes = []
+
+    def hit():
+        codes.append(_release(_rid(), rid).status_code)
+
+    threads = [threading.Thread(target=hit) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert codes.count(200) == 1, f"成功释放 {codes.count(200)} 次，应恰好 1 次"
+    assert codes.count(409) == 9
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 0
+
+
+def test_concurrent_same_release_id_all_replay():
+    """同一 release_id 并发重放同一释放：全部 200，只撤销一次。"""
+    key = _bucket(10, 60)
+    rid = _rid()
+    assert _consume(rid, key, 2).status_code == 200
+    rel = _rid()
+    payload = {"release_id": rel, "request_id": rid}
+    codes = []
+
+    def hit():
+        codes.append(client.post("/v1/quota/releases", json=payload).status_code)
+
+    threads = [threading.Thread(target=hit) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(c == 200 for c in codes)
+    assert client.get(f"/v1/buckets/{key}/usage").json()["used"] == 0
+
+
+def test_release_other_requests_keep_usage():
+    """释放一个请求不得影响其他请求的用量。"""
+    key = _bucket(10, 60)
+    rid1, rid2 = _rid(), _rid()
+    assert _consume(rid1, key, 3).status_code == 200
+    assert _consume(rid2, key, 4).status_code == 200
+
+    assert _release(_rid(), rid1).status_code == 200
+    usage = client.get(f"/v1/buckets/{key}/usage").json()
+    assert usage["used"] == 4
+
+
+def test_release_validation_errors():
+    assert client.post("/v1/quota/releases", json={
+        "release_id": "", "request_id": "x",
+    }).status_code == 422
+    assert client.post("/v1/quota/releases", json={
+        "release_id": "x",
     }).status_code == 422

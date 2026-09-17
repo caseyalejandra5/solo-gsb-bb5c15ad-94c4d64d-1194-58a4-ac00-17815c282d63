@@ -5,7 +5,11 @@
   任一超限则整体不扣减（原子性）；
 - BEGIN IMMEDIATE 使写事务串行化，并发请求不会突破限额；
 - request_id 首次出现时固化载荷与判定，重复提交原样返回，
-  载荷变化返回 409。
+  载荷变化返回 409；
+- release_id 首次释放时在单事务内撤销原请求对全部桶的用量贡献，
+  同键同目标重放原样返回，改指其他 request_id 返回 409；
+- 同一消费请求只能被一个 release_id 成功释放（releases.request_id 唯一约束
+  兜底并发竞争）；释放后重放 consume 仍返回固化判定且不再扣减。
 """
 from __future__ import annotations
 
@@ -23,7 +27,7 @@ from fastapi.responses import JSONResponse
 from . import config
 from .db import _rollback_quietly, connect, init_db, seed_buckets
 from .quota import earliest_retry_at, merge_items, payload_hash
-from .schemas import BucketConfig, ConsumeRequest
+from .schemas import BucketConfig, ConsumeRequest, ReleaseRequest
 
 logger = logging.getLogger("quota")
 
@@ -104,6 +108,118 @@ def consume(req: ConsumeRequest):
         conn.close()
 
     return _decision_response(decision, replayed)
+
+
+# ---------------------------------------------------------------- 配额释放
+
+@app.post("/v1/quota/releases")
+def release(req: ReleaseRequest):
+    """撤销原消费请求对所有桶的用量贡献（释放配额）。
+
+    - 200：首次释放成功，原请求的全部用量事件已在同一事务内删除；
+    - 同 release_id + 同 request_id 重放：原样返回首次结果，
+      响应头 X-Idempotent-Replay: true；
+    - 409：release_id 已指向其他 request_id；原请求判定为拒绝（无用量可释放）；
+      该 request_id 已被其他 release_id 释放（含并发竞争中的落败者）；
+    - 404：原 request_id 不存在。
+    """
+    now = time.time()
+
+    replayed = False
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = conn.execute(
+                "SELECT request_id, result FROM releases WHERE release_id = ?",
+                (req.release_id,),
+            ).fetchone()
+
+            if existing is not None:
+                # 幂等：同 release_id 必须指向同一 request_id，原样返回
+                if existing["request_id"] != req.request_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"release_id '{req.release_id}' 已用于释放 "
+                            f"request_id '{existing['request_id']}'，不可改指其他目标"
+                        ),
+                    )
+                result = json.loads(existing["result"])
+                replayed = True
+                conn.execute("COMMIT")
+            else:
+                result = _release_and_record(conn, req.release_id, req.request_id, now)
+                conn.execute("COMMIT")
+        except HTTPException:
+            _rollback_quietly(conn)
+            raise
+        except sqlite3.IntegrityError:
+            # request_id 唯一约束：并发竞争中另一个 release_id 已抢先成功
+            _rollback_quietly(conn)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"request_id '{req.request_id}' 已被其他 release_id 释放；"
+                    "同一消费请求只能释放一次"
+                ),
+            )
+        except Exception:
+            _rollback_quietly(conn)
+            raise
+    finally:
+        conn.close()
+
+    return JSONResponse(
+        status_code=200,
+        content=result,
+        headers={"X-Idempotent-Replay": "true"} if replayed else None,
+    )
+
+
+def _release_and_record(
+    conn: sqlite3.Connection, release_id: str, request_id: str, now: float
+) -> dict:
+    """在事务内撤销原请求的全部用量并固化释放结果。
+
+    删除用量事件与写入 releases 记录同事务提交：不可能出现部分桶已恢复。
+    """
+    row = conn.execute(
+        "SELECT allowed, payload FROM requests WHERE request_id = ?",
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"request_id '{request_id}' 不存在，无可释放的消费请求",
+        )
+    if not row["allowed"]:
+        raise HTTPException(
+            status_code=409,
+            detail=f"request_id '{request_id}' 的原判定为拒绝，未产生用量，无需释放",
+        )
+
+    # 撤销该请求对所有桶的用量贡献；固化载荷即释放明细
+    deleted = conn.execute(
+        "DELETE FROM usage_events WHERE request_id = ?", (request_id,)
+    ).rowcount
+    payload = json.loads(row["payload"])
+    released_buckets = payload["buckets"]
+
+    result = {
+        "release_id": release_id,
+        "request_id": request_id,
+        "released": True,
+        "released_buckets": released_buckets,
+        "events_released": deleted,
+        "released_at": now,
+    }
+    conn.execute(
+        "INSERT INTO releases (release_id, request_id, result, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (release_id, request_id, json.dumps(result), now),
+    )
+    return result
 
 
 def _evaluate_and_consume(
